@@ -100,6 +100,8 @@ class CodeParser:
         
         # Remove __pycache__ directories
         py_files = [f for f in py_files if '__pycache__' not in str(f)]
+        py_files = [f for f in py_files if '.git' not in str(f)]
+        py_files = [f for f in py_files if '.venv' not in str(f)]
         
         print(f"📁 Found {len(py_files)} Python files")
         

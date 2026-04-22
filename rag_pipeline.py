@@ -2,81 +2,33 @@ from chunking import GraphChunker
 from embeddings import EmbeddingStore
 from neo4j import GraphDatabase
 import os
-import requests
-import json
+import re
 from dotenv import load_dotenv
+from openai import OpenAI
 
 load_dotenv()
 
 class RAGPipeline:
-    """Complete RAG pipeline: Graph + Vector + LLM (Ollama)"""
+    """Complete RAG pipeline: Graph + Vector + LLM (Gemini via OpenAI compatible API)"""
     
     def __init__(self):
         print("🚀 Initializing RAG Pipeline...")
         self.chunker = GraphChunker()
-        self.vector_store = EmbeddingStore(fresh_start=False)  # Don't auto-delete
+        self.vector_store = EmbeddingStore(fresh_start=False)
         
-        # Ollama configuration
-        self.ollama_url = "http://localhost:11434/api/generate"
-        self.model = "llama3.2:3b"
-        self.llm_available = self._check_ollama()
+        # Initialize Gemini via OpenAI-compatible endpoint
+        self.llm = OpenAI(
+            api_key=os.getenv("GOOGLE_API_KEY"),
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+        )
+        self.model = "gemini-2.0-flash"
         
         self.neo4j_driver = GraphDatabase.driver(
             os.getenv("NEO4J_URI"),
             auth=(os.getenv("NEO4J_USER"), os.getenv("NEO4J_PASSWORD"))
         )
-    
-    def _check_ollama(self):
-        """Check if Ollama is running"""
-        try:
-            response = requests.get("http://localhost:11434/api/tags")
-            if response.status_code == 200:
-                models = response.json().get('models', [])
-                model_names = [m['name'] for m in models]
-                
-                if self.model not in str(model_names):
-                    print(f"⚠️  Model {self.model} not found. Pulling it now...")
-                    os.system(f"ollama pull {self.model}")
-                
-                print(f"✅ Ollama is ready! Using model: {self.model}")
-                return True
-            return False
-        except:
-            print("❌ Ollama is not running!")
-            print("   Please start Ollama from Start Menu or system tray")
-            return False
-    
-    def _call_ollama(self, prompt):
-        """Call Ollama API with longer timeout"""
-        if not self.llm_available:
-            return None
         
-        try:
-            response = requests.post(
-                self.ollama_url,
-                json={
-                    "model": self.model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "temperature": 0.3,
-                    "max_tokens": 300
-                },
-                timeout=120  # Increase from 30 to 120 seconds
-            )
-            
-            if response.status_code == 200:
-                return response.json()['response']
-            else:
-                print(f"⚠️  Ollama error: {response.status_code}")
-                return None
-                
-        except requests.exceptions.Timeout:
-            print(f"⚠️  Ollama timeout - model is still thinking...")
-            print(f"   Try again or use a smaller model")
-            return None
-        except Exception as e:
-            print(f"⚠️  Ollama error: {e}")
-            return None
+        print("✅ Gemini API ready! Using model: " + self.model)
     
     def index_graph(self):
         """Step 1: Extract all data from Neo4j and create embeddings"""
@@ -85,7 +37,6 @@ class RAGPipeline:
         print("="*50)
         
         try:
-            # Get chunks from graph
             chunks = self.chunker.get_all_chunks()
             
             if not chunks:
@@ -93,7 +44,6 @@ class RAGPipeline:
                 print("   Run: python main.py test_repo first")
                 return False
             
-            # Create embeddings and store
             self.vector_store.create_embeddings(chunks)
             
             print("\n✅ Indexing complete!")
@@ -123,7 +73,6 @@ class RAGPipeline:
             print(f"⚠️  Graph search error: {e}")
             graph_matches = []
         
-        # Combine results
         context = {
             'vector_matches': vector_matches,
             'graph_matches': graph_matches
@@ -133,12 +82,9 @@ class RAGPipeline:
     
     def _graph_search(self, query):
         """Search Neo4j for exact matches"""
-        
-        # Extract keywords from query
         keywords = query.lower().split()
         
         with self.neo4j_driver.session() as session:
-            # Search for functions with matching names
             result = session.run("""
                 MATCH (f:Function)
                 WHERE any(keyword IN $keywords WHERE toLower(f.name) CONTAINS keyword)
@@ -150,71 +96,137 @@ class RAGPipeline:
         
         return matches
     
-    def generate_answer(self, query, context):
-        """Step 3: Generate answer using Ollama"""
+    def _get_filename(self, filepath):
+        """Extract filename from full path safely"""
+        return os.path.basename(filepath)
+    
+    def _answer_from_neo4j_direct(self, question):
+        """Direct Neo4j queries for common question types - NO LLM"""
+        question_lower = question.lower()
         
-        # Format context for LLM
+        # Count classes
+        if 'class' in question_lower and ('how many' in question_lower or 'count' in question_lower):
+            with self.neo4j_driver.session() as session:
+                result = session.run("MATCH (c:Class) RETURN count(c) as count")
+                count = result.single()['count']
+                if count > 0:
+                    classes = session.run("MATCH (c:Class) RETURN c.name as name, c.file as file")
+                    class_list = []
+                    for record in classes:
+                        filename = self._get_filename(record['file'])
+                        class_list.append(f"{record['name']} in {filename}")
+                    return f"Found {count} class(es): {', '.join(class_list)}"
+                return "Found 0 classes in the codebase."
+        
+        # Count functions
+        if 'function' in question_lower and ('how many' in question_lower or 'count' in question_lower):
+            with self.neo4j_driver.session() as session:
+                result = session.run("MATCH (f:Function) RETURN count(f) as count")
+                count = result.single()['count']
+                return f"Found {count} function(s) in the codebase."
+        
+        # Which file calls X?
+        if 'calls' in question_lower:
+            match = re.search(r'calls (\w+)', question_lower)
+            if match:
+                func_name = match.group(1)
+                with self.neo4j_driver.session() as session:
+                    result = session.run("""
+                        MATCH (caller:Function)-[:CALLS]->(callee:Function {name: $name})
+                        RETURN caller.name as caller, caller.file as file
+                    """, name=func_name)
+                    callers = list(result)
+                    if callers:
+                        caller_names = []
+                        for c in callers:
+                            filename = self._get_filename(c['file'])
+                            caller_names.append(f"{c['caller']} (in {filename})")
+                        return f"Function '{func_name}' is called by: {', '.join(caller_names)}"
+                    return f"No functions call '{func_name}'"
+        
+        # List all files
+        if 'file' in question_lower and ('list' in question_lower or 'all' in question_lower):
+            with self.neo4j_driver.session() as session:
+                result = session.run("MATCH (f:File) RETURN f.path as file")
+                files = [self._get_filename(record['file']) for record in result]
+                return f"Files in codebase: {', '.join(files)}"
+        
+        return None
+    
+    def generate_answer(self, query, context):
+        """Step 3: Generate answer using Gemini"""
+        
+        # First try direct Neo4j query (NO LLM)
+        direct_answer = self._answer_from_neo4j_direct(query)
+        if direct_answer:
+            return direct_answer
+        
+        # Otherwise use Gemini
         formatted_context = self._format_context_for_llm(context)
         
-        prompt = f"""You are a codebase expert. Answer the question based ONLY on the code structure below.
+        prompt = f"""You are a code analysis system. Answer based ONLY on the context below.
+
+CONTEXT:
+{formatted_context}
 
 QUESTION: {query}
 
-CODE CONTEXT:
-{formatted_context}
-
-INSTRUCTIONS:
-1. Only use information from the context above
-2. Be specific - mention function names and file locations
-3. If the answer isn't in context, say "I couldn't find this in the codebase"
-4. Keep answer concise but informative (max 150 words)
+RULES:
+1. ONLY use information from CONTEXT
+2. If answer not in context, say "Not found in codebase"
+3. Be specific - mention function names and file locations
 
 ANSWER:"""
         
-        # Try Ollama first
-        if self.llm_available:
-            answer = self._call_ollama(prompt)
-            if answer:
-                return answer
-        
-        # Fallback to formatted search results
-        return self._format_search_results(context)
+        try:
+            response = self.llm.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are a codebase expert. Answer only from given context."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                max_tokens=300
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            print(f"⚠️  Gemini error: {e}")
+            return self._format_search_results(context)
     
     def _format_context_for_llm(self, context):
         """Format retrieved context for LLM"""
         text = ""
         
-        # Add vector search results
-        if context['vector_matches']:
-            text += "Similar code chunks found:\n\n"
-            for i, doc in enumerate(context['vector_matches'][:3]):
-                # Truncate long docs
-                doc_preview = doc[:500] + "..." if len(doc) > 500 else doc
-                text += f"--- Chunk {i+1} ---\n{doc_preview}\n\n"
-        
-        # Add graph search results
         if context['graph_matches']:
-            text += "\nExact matches from graph:\n"
-            for match in context['graph_matches'][:3]:
-                text += f"- {match['name']} (in {match['file']})\n"
+            text += "EXACT MATCHES:\n"
+            for match in context['graph_matches']:
+                filename = self._get_filename(match['file'])
+                text += f"• {match['name']} -> in: {filename}\n"
+            text += "\n"
         
-        return text if text else "No relevant code found in the codebase."
+        if context['vector_matches']:
+            text += "CODE CHUNKS:\n"
+            for i, doc in enumerate(context['vector_matches'][:3]):
+                doc_preview = doc[:400] + "..." if len(doc) > 400 else doc
+                text += f"\n[{i+1}]\n{doc_preview}\n"
+        
+        if not text:
+            text = "No relevant code found."
+        
+        return text
     
     def _format_search_results(self, context):
         """Format search results as plain text (fallback)"""
         result_text = "🔍 SEARCH RESULTS:\n\n"
         
         if context['graph_matches']:
-            result_text += "📌 Exact matches found:\n"
+            result_text += "Exact matches:\n"
             for match in context['graph_matches']:
-                result_text += f"  • {match['name']} - in {match['file']}\n"
-        else:
-            result_text += "📌 No exact matches found.\n"
+                filename = self._get_filename(match['file'])
+                result_text += f"  • {match['name']} - in {filename}\n"
         
         if context['vector_matches']:
-            result_text += f"\n📄 Found {len(context['vector_matches'])} semantically similar code chunks:\n"
-            for i, doc in enumerate(context['vector_matches'][:2]):
-                result_text += f"\n--- Chunk {i+1} ---\n{doc[:300]}\n"
+            result_text += f"\nFound {len(context['vector_matches'])} similar chunks.\n"
         
         return result_text
     
@@ -224,10 +236,7 @@ ANSWER:"""
         print(f"🤔 QUESTION: {question}")
         print("="*60)
         
-        # Step 2: Retrieve context
         context = self.retrieve_context(question)
-        
-        # Step 3: Generate answer
         answer = self.generate_answer(question, context)
         
         print("\n💡 ANSWER:")
@@ -245,12 +254,11 @@ ANSWER:"""
         except:
             pass
 
-# Main execution
+
 # Main execution
 if __name__ == "__main__":
     import sys
     
-    # Check for --reindex flag
     reindex = False
     if len(sys.argv) > 1 and sys.argv[1] == "--reindex":
         reindex = True
@@ -258,14 +266,11 @@ if __name__ == "__main__":
     
     rag = RAGPipeline()
     
-    # Force re-index if requested
     if reindex:
         print("\n🗑️  Clearing existing embeddings...")
         rag.vector_store.clear_all()
         rag.vector_store = EmbeddingStore(fresh_start=True)
-        rag.vector_store.collection = rag.vector_store.chroma_client.get_collection("code_chunks")
     
-    # ONLY index if no chunks exist OR reindex flag is set
     if rag.vector_store.collection.count() == 0:
         print("\n📚 No existing embeddings found. Indexing graph data...")
         success = rag.index_graph()
@@ -274,12 +279,9 @@ if __name__ == "__main__":
             exit(1)
     else:
         print(f"\n✅ Found {rag.vector_store.collection.count()} existing chunks in database")
-        print("   Skipping indexing. Use --reindex flag to force re-index.")
     
-    print("\n✅ Ready for questions! Using Ollama + " + rag.model)
-    print("💡 Tip: First query might be slow as model loads into memory")
+    print("\n✅ Ready for questions! Using Gemini via OpenAI compatible API")
     
-    # Interactive question loop
     while True:
         print("\n" + "-"*60)
         question = input("\n❓ Ask about your codebase (or 'quit' to exit): ")

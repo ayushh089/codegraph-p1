@@ -1,20 +1,25 @@
-from sentence_transformers import SentenceTransformer
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 import chromadb
 from chromadb.utils import embedding_functions
 import os
 import hashlib
 import logging
+from dotenv import load_dotenv
 
-# Suppress warnings
+load_dotenv()
 logging.getLogger('sentence_transformers').setLevel(logging.ERROR)
 
 class EmbeddingStore:
-    """Handle embeddings and vector storage"""
+    """Handle embeddings using Google Gemini and vector storage"""
     
-    def __init__(self, fresh_start=False):  # Add parameter
-        # Load embedding model
-        print("🔄 Loading embedding model (this may take a moment)...")
-        self.model = SentenceTransformer('all-MiniLM-L6-v2')
+    def __init__(self, fresh_start=False):
+        print("🔄 Loading Google Gemini Embedding model...")
+        
+        # Initialize Google Gemini Embeddings
+        self.embedding_model = GoogleGenerativeAIEmbeddings(
+            model="models/embedding-001",
+            google_api_key=os.getenv("GOOGLE_API_KEY")
+        )
         
         # Create ChromaDB client
         self.chroma_client = chromadb.PersistentClient(path="./chroma_db")
@@ -31,18 +36,20 @@ class EmbeddingStore:
             except Exception as e:
                 print(f"⚠️  Note: {e}")
         
-        # Get or create collection (don't delete automatically)
+        # Get or create collection
         try:
             self.collection = self.chroma_client.get_collection("code_chunks")
             print(f"✅ Found existing collection with {self.collection.count()} chunks")
         except:
             self.collection = self.chroma_client.create_collection(
                 name="code_chunks",
-                embedding_function=embedding_functions.SentenceTransformerEmbeddingFunction()
+                embedding_function=embedding_functions.GoogleGenerativeAiEmbeddingFunction(
+                    api_key=os.getenv("GOOGLE_API_KEY")
+                )
             )
             print("✅ Created new collection")
         
-        print("✅ Embedding model loaded (all-MiniLM-L6-v2)")
+        print("✅ Google Gemini Embedding model loaded")
         print(f"📀 ChromaDB ready with {self.collection.count()} existing chunks")
     
     def needs_indexing(self):
@@ -52,14 +59,12 @@ class EmbeddingStore:
     def create_embeddings(self, chunks):
         """Convert chunks to embeddings and store in ChromaDB"""
         
-        # Check if already indexed
         if self.collection.count() > 0:
             print(f"\n✅ Already have {self.collection.count()} chunks indexed. Skipping...")
             return True
         
         print(f"\n🔄 Creating embeddings for {len(chunks)} chunks...")
         
-        # Prepare data for ChromaDB
         ids = []
         documents = []
         metadatas = []
@@ -78,7 +83,6 @@ class EmbeddingStore:
                     safe_metadata[key] = str(value)
             metadatas.append(safe_metadata)
         
-        # Add to ChromaDB in batches
         batch_size = 50
         for i in range(0, len(ids), batch_size):
             batch_ids = ids[i:i+batch_size]
@@ -113,9 +117,10 @@ class EmbeddingStore:
         except:
             pass
         
-        # Create fresh collection
         self.collection = self.chroma_client.create_collection(
             name="code_chunks",
-            embedding_function=embedding_functions.SentenceTransformerEmbeddingFunction()
+            embedding_function=embedding_functions.GoogleGenerativeAiEmbeddingFunction(
+                api_key=os.getenv("GOOGLE_API_KEY")
+            )
         )
         print("✅ Created fresh collection")
